@@ -24,6 +24,7 @@ public class MainViewModel : INotifyPropertyChanged
     private bool _isConnecting;
     private string _connectionStatus = "Not connected";
     private bool _useScanMode;
+    private bool _useContainsMode;
 
     public string AccessKeyId
     {
@@ -114,6 +115,12 @@ public class MainViewModel : INotifyPropertyChanged
         set { _useScanMode = value; OnPropertyChanged(); }
     }
 
+    public bool UseContainsMode
+    {
+        get => _useContainsMode;
+        set { _useContainsMode = value; OnPropertyChanged(); }
+    }
+
     public ICommand DeleteCommand { get; }
     public ICommand ConnectCommand { get; }
 
@@ -169,10 +176,16 @@ public class MainViewModel : INotifyPropertyChanged
             return "Table Name is required.";
         if (string.IsNullOrWhiteSpace(PkAttributeName))
             return "PK Attribute Name is required.";
-        if (string.IsNullOrWhiteSpace(PkValue))
-            return "PK Value is required.";
         if (string.IsNullOrWhiteSpace(SkAttributeName))
             return "SK Attribute Name is required for batch delete.";
+
+        // Scan modes: tillad tom PK+SK (sletter alt)
+        // Query mode kræver PK
+        if (!(UseScanMode || UseContainsMode))
+        {
+            if (string.IsNullOrWhiteSpace(PkValue))
+                return "PK Value is required.";
+        }
 
         return null;
     }
@@ -188,7 +201,10 @@ public class MainViewModel : INotifyPropertyChanged
 
         IsDeleting = true;
         LogText = ""; // Clear log
-        Log(UseScanMode ? "Scanning table (begins_with)..." : "Querying items (exact match)...");
+        var modeText = UseContainsMode ? "Scanning table (contains)..." 
+            : UseScanMode ? "Scanning table (begins_with)..." 
+            : "Querying items (exact match)...";
+        Log(modeText);
 
         try
         {
@@ -196,9 +212,11 @@ public class MainViewModel : INotifyPropertyChanged
             var regionEndpoint = RegionEndpoint.GetBySystemName(Region);
             using var client = new AmazonDynamoDBClient(credentials, regionEndpoint);
 
-            var allKeys = UseScanMode 
-                ? await ScanItemsAsync(client) 
-                : await QueryItemsAsync(client);
+            var allKeys = UseContainsMode 
+                ? await ScanItemsAsync(client, useContains: true)
+                : UseScanMode 
+                    ? await ScanItemsAsync(client, useContains: false) 
+                    : await QueryItemsAsync(client);
 
             if (allKeys.Count == 0)
             {
@@ -208,9 +226,14 @@ public class MainViewModel : INotifyPropertyChanged
 
             // Confirmation dialog
             Log($"Found {allKeys.Count} items to delete.");
+            var modeDisplay = UseContainsMode ? "Scan (contains)" 
+                : UseScanMode ? "Scan (begins_with)" 
+                : "Query (exact)";
+            var isDeleteAll = string.IsNullOrWhiteSpace(PkValue) && string.IsNullOrWhiteSpace(SkValue);
+            var warningText = isDeleteAll ? "⚠️ WARNING: This will delete ALL items in the table!\n\n" : "";
             var confirmResult = System.Windows.MessageBox.Show(
-                $"You are about to delete {allKeys.Count} items.\n\nTable: {TableName}\nPK: {PkValue}\nSK: {(string.IsNullOrWhiteSpace(SkValue) ? "(all)" : SkValue)}\nMode: {(UseScanMode ? "Scan (begins_with)" : "Query (exact)")}\n\nAre you sure?",
-                "Confirm Delete",
+                $"{warningText}You are about to delete {allKeys.Count} items.\n\nTable: {TableName}\nPK: {(string.IsNullOrWhiteSpace(PkValue) ? "(any)" : PkValue)}\nSK: {(string.IsNullOrWhiteSpace(SkValue) ? "(any)" : SkValue)}\nMode: {modeDisplay}\n\nAre you sure?",
+                isDeleteAll ? "⚠️ DELETE ALL - Confirm" : "Confirm Delete",
                 System.Windows.MessageBoxButton.YesNo,
                 System.Windows.MessageBoxImage.Warning);
 
@@ -291,30 +314,38 @@ public class MainViewModel : INotifyPropertyChanged
         return allKeys;
     }
 
-    private async Task<List<Dictionary<string, AttributeValue>>> ScanItemsAsync(AmazonDynamoDBClient client)
+    private async Task<List<Dictionary<string, AttributeValue>>> ScanItemsAsync(AmazonDynamoDBClient client, bool useContains = false)
     {
         var allKeys = new List<Dictionary<string, AttributeValue>>();
         Dictionary<string, AttributeValue>? lastKey = null;
 
-        // Build filter expression for begins_with on PK (and optionally SK)
-        var filterParts = new List<string> { "begins_with(#pk, :pkval)" };
+        var filterFunc = useContains ? "contains" : "begins_with";
+        var filterParts = new List<string>();
         var attrNames = new Dictionary<string, string> { { "#pk", PkAttributeName }, { "#sk", SkAttributeName } };
-        var attrValues = new Dictionary<string, AttributeValue> { { ":pkval", new AttributeValue { S = PkValue } } };
+        var attrValues = new Dictionary<string, AttributeValue>();
+
+        if (!string.IsNullOrWhiteSpace(PkValue))
+        {
+            filterParts.Add($"{filterFunc}(#pk, :pkval)");
+            attrValues[":pkval"] = new AttributeValue { S = PkValue };
+        }
 
         if (!string.IsNullOrWhiteSpace(SkValue))
         {
-            filterParts.Add("begins_with(#sk, :skval)");
+            filterParts.Add($"{filterFunc}(#sk, :skval)");
             attrValues[":skval"] = new AttributeValue { S = SkValue };
         }
+
+        var filterExpression = filterParts.Count > 0 ? string.Join(" AND ", filterParts) : null;
 
         do
         {
             var scanRequest = new ScanRequest
             {
                 TableName = TableName,
-                FilterExpression = string.Join(" AND ", filterParts),
+                FilterExpression = filterExpression,
                 ExpressionAttributeNames = attrNames,
-                ExpressionAttributeValues = attrValues,
+                ExpressionAttributeValues = attrValues.Count > 0 ? attrValues : null,
                 ProjectionExpression = "#pk, #sk",
                 ExclusiveStartKey = lastKey
             };
@@ -331,7 +362,7 @@ public class MainViewModel : INotifyPropertyChanged
             }
 
             lastKey = response.LastEvaluatedKey;
-            Log($"Scanned... found {allKeys.Count} matching items so far...");
+            Log($"Scanned ({(useContains ? "contains" : "begins_with")})... found {allKeys.Count} matching items so far...");
 
         } while (lastKey != null && lastKey.Count > 0);
 
