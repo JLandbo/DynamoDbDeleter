@@ -1,5 +1,8 @@
 using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
 using System.Runtime.CompilerServices;
+using System.Windows;
 using System.Windows.Input;
 using Amazon;
 using Amazon.DynamoDBv2;
@@ -16,7 +19,7 @@ public class MainViewModel : INotifyPropertyChanged
     private string _tableName = string.Empty;
     private string _pkAttributeName = "PK";
     private string _pkValue = string.Empty;
-    private string _skAttributeName = string.Empty;
+    private string _skAttributeName = "SK";
     private string _skValue = string.Empty;
     private string _logText = string.Empty;
     private bool _isDeleting;
@@ -123,11 +126,50 @@ public class MainViewModel : INotifyPropertyChanged
 
     public ICommand DeleteCommand { get; }
     public ICommand ConnectCommand { get; }
+    public ICommand OpenCredentialsFileCommand { get; }
 
     public MainViewModel()
     {
         DeleteCommand = new RelayCommand(DeleteItemAsync, () => !IsDeleting && IsConnected);
         ConnectCommand = new RelayCommand(ConnectAsync, () => !IsConnecting);
+        OpenCredentialsFileCommand = new RelayCommand(OpenCredentialsFileAsync);
+    }
+
+    private Task OpenCredentialsFileAsync()
+    {
+        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var credentialsPath = Path.Combine(userProfile, ".aws", "credentials");
+
+        try
+        {
+            if (File.Exists(credentialsPath))
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "notepad.exe",
+                    Arguments = credentialsPath,
+                    UseShellExecute = true
+                });
+            }
+            else
+            {
+                MessageBox.Show(
+                    $"AWS credentials file not found at:\n{credentialsPath}",
+                    "File Not Found",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                $"Could not open credentials file:\n{ex.Message}",
+                "Error",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+        }
+
+        return Task.CompletedTask;
     }
 
     private async Task ConnectAsync()
@@ -179,12 +221,9 @@ public class MainViewModel : INotifyPropertyChanged
         if (string.IsNullOrWhiteSpace(SkAttributeName))
             return "SK Attribute Name is required for batch delete.";
 
-        // Scan modes: tillad tom PK+SK (sletter alt)
-        // Query mode kræver PK
         if (!(UseScanMode || UseContainsMode))
         {
-            if (string.IsNullOrWhiteSpace(PkValue))
-                return "PK Value is required.";
+            if (string.IsNullOrWhiteSpace(PkValue)) return "PK Value is required.";
         }
 
         return null;
@@ -201,8 +240,8 @@ public class MainViewModel : INotifyPropertyChanged
 
         IsDeleting = true;
         LogText = ""; // Clear log
-        var modeText = UseContainsMode ? "Scanning table (contains)..." 
-            : UseScanMode ? "Scanning table (begins_with)..." 
+        var modeText = UseContainsMode ? "Scanning table (contains)..."
+            : UseScanMode ? "Scanning table (begins_with)..."
             : "Querying items (exact match)...";
         Log(modeText);
 
@@ -212,10 +251,10 @@ public class MainViewModel : INotifyPropertyChanged
             var regionEndpoint = RegionEndpoint.GetBySystemName(Region);
             using var client = new AmazonDynamoDBClient(credentials, regionEndpoint);
 
-            var allKeys = UseContainsMode 
+            var allKeys = UseContainsMode
                 ? await ScanItemsAsync(client, useContains: true)
-                : UseScanMode 
-                    ? await ScanItemsAsync(client, useContains: false) 
+                : UseScanMode
+                    ? await ScanItemsAsync(client, useContains: false)
                     : await QueryItemsAsync(client);
 
             if (allKeys.Count == 0)
@@ -226,34 +265,31 @@ public class MainViewModel : INotifyPropertyChanged
 
             // Confirmation dialog
             Log($"Found {allKeys.Count} items to delete.");
-            var modeDisplay = UseContainsMode ? "Scan (contains)" 
-                : UseScanMode ? "Scan (begins_with)" 
+            var modeDisplay = UseContainsMode ? "Scan (contains)"
+                : UseScanMode ? "Scan (begins_with)"
                 : "Query (exact)";
             var isDeleteAll = string.IsNullOrWhiteSpace(PkValue) && string.IsNullOrWhiteSpace(SkValue);
             var warningText = isDeleteAll ? "⚠️ WARNING: This will delete ALL items in the table!\n\n" : "";
-            var confirmResult = System.Windows.MessageBox.Show(
+            var confirmResult = MessageBox.Show(
                 $"{warningText}You are about to delete {allKeys.Count} items.\n\nTable: {TableName}\nPK: {(string.IsNullOrWhiteSpace(PkValue) ? "(any)" : PkValue)}\nSK: {(string.IsNullOrWhiteSpace(SkValue) ? "(any)" : SkValue)}\nMode: {modeDisplay}\n\nAre you sure?",
                 isDeleteAll ? "⚠️ DELETE ALL - Confirm" : "Confirm Delete",
-                System.Windows.MessageBoxButton.YesNo,
-                System.Windows.MessageBoxImage.Warning);
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning);
 
-            if (confirmResult != System.Windows.MessageBoxResult.Yes)
+            if (confirmResult != MessageBoxResult.Yes)
             {
                 Log("Delete cancelled by user.");
                 IsDeleting = false;
                 return;
             }
 
-            // Build delete requests
-            var writeRequests = allKeys.Select(key => new WriteRequest
+            // Use batch delete service with parallel processing and retry logic
+            var batchService = new BatchDeleteService(client, TableName, msg => Application.Current.Dispatcher.Invoke(() => Log(msg)));
+
+            await batchService.ExecuteBatchDeleteAsync([.. allKeys.Select(key => new WriteRequest
             {
                 DeleteRequest = new DeleteRequest { Key = key }
-            }).ToList();
-
-            // Use batch delete service with parallel processing and retry logic
-            var batchService = new BatchDeleteService(client, TableName, msg => 
-                System.Windows.Application.Current.Dispatcher.Invoke(() => Log(msg)));
-            await batchService.ExecuteBatchDeleteAsync(writeRequests);
+            })]);
 
             Log($"Deleted {allKeys.Count} items successfully.");
         }
@@ -272,15 +308,17 @@ public class MainViewModel : INotifyPropertyChanged
         var allKeys = new List<Dictionary<string, AttributeValue>>();
         Dictionary<string, AttributeValue>? lastKey = null;
 
-        // Build key condition - PK exact match, optionally SK exact match too
         var keyCondition = "#pk = :pkval";
-        var attrNames = new Dictionary<string, string> { { "#pk", PkAttributeName }, { "#sk", SkAttributeName } };
-        var attrValues = new Dictionary<string, AttributeValue> { { ":pkval", new AttributeValue { S = PkValue } } };
+        var attrNames = new Dictionary<string, string> { 
+            { "#pk", PkAttributeName }, 
+            { "#sk", SkAttributeName } 
+        };
+        var attrValues = new Dictionary<string, AttributeValue> { { ":pkval", new AttributeValue(PkValue) } };
 
         if (!string.IsNullOrWhiteSpace(SkValue))
         {
             keyCondition += " AND #sk = :skval";
-            attrValues[":skval"] = new AttributeValue { S = SkValue };
+            attrValues[":skval"] = new AttributeValue(SkValue);
         }
 
         do
@@ -321,19 +359,22 @@ public class MainViewModel : INotifyPropertyChanged
 
         var filterFunc = useContains ? "contains" : "begins_with";
         var filterParts = new List<string>();
-        var attrNames = new Dictionary<string, string> { { "#pk", PkAttributeName }, { "#sk", SkAttributeName } };
+        var attrNames = new Dictionary<string, string> { 
+            { "#pk", PkAttributeName }, 
+            { "#sk", SkAttributeName } 
+        };
         var attrValues = new Dictionary<string, AttributeValue>();
 
         if (!string.IsNullOrWhiteSpace(PkValue))
         {
             filterParts.Add($"{filterFunc}(#pk, :pkval)");
-            attrValues[":pkval"] = new AttributeValue { S = PkValue };
+            attrValues[":pkval"] = new AttributeValue(PkValue);
         }
 
         if (!string.IsNullOrWhiteSpace(SkValue))
         {
             filterParts.Add($"{filterFunc}(#sk, :skval)");
-            attrValues[":skval"] = new AttributeValue { S = SkValue };
+            attrValues[":skval"] = new AttributeValue(SkValue);
         }
 
         var filterExpression = filterParts.Count > 0 ? string.Join(" AND ", filterParts) : null;
@@ -362,6 +403,7 @@ public class MainViewModel : INotifyPropertyChanged
             }
 
             lastKey = response.LastEvaluatedKey;
+
             Log($"Scanned ({(useContains ? "contains" : "begins_with")})... found {allKeys.Count} matching items so far...");
 
         } while (lastKey != null && lastKey.Count > 0);
