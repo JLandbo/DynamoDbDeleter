@@ -70,7 +70,7 @@
             <Label Content="SK Attribute Name *"/>
 			<TextBox Text="{Binding SkAttributeName, UpdateSourceTrigger=PropertyChanged}"/>
 
-			<Label Content="SK Value (leave empty to match all SK)"/>
+			<Label Content="SK Value"/>
 			<TextBox Text="{Binding SkValue, UpdateSourceTrigger=PropertyChanged}"/>
 
 			<CheckBox Content="Scan mode (begins_with on PK/SK)"
